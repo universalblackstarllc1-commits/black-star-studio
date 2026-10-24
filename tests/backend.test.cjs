@@ -1,0 +1,46 @@
+const assert=require('node:assert/strict');
+const fs=require('node:fs'),vm=require('node:vm'),crypto=require('node:crypto');
+const core=require('../core.js');
+const valid={id:'test-1',title:'A useful freight post',body:'Check the cargo securement requirements for the actual load.',category:'Equipment & securement',status:'approved',sources:['https://www.ecfr.gov/'],evidence:'Scope of the federal cargo securement rules.',reviewedAt:'2026-01-01',reviewed:true,revision:0};
+assert.equal(core.issues(valid).length,0);
+assert.ok(core.issues({...valid,body:'Hello 🚚'}).some(x=>x.includes('emojis')));
+assert.ok(core.issues({...valid,body:'a'.repeat(3001)}).some(x=>x.includes('3,000')));
+assert.ok(core.issues({...valid,sources:['javascript:alert(1)']}).length);
+assert.ok(core.issues({...valid,category:'Freight rates'}).some(x=>x.includes('lane')));
+assert.ok(core.issues({...valid,reviewed:false}).length);
+assert.ok(core.issues({...valid,reviewedAt:'2099-01-01'}).length);
+let values={WORKSPACE_KEY:'test-only-key',PAGE_ORIGIN:'https://example.github.io',SPREADSHEET_ID:'test',LINKEDIN_APPROVED:'true',LINKEDIN_ORGANIZATION_ID:'12345',LINKEDIN_VERSION:'202606',LINKEDIN_ACCESS_TOKEN:'test-only-token',LINKEDIN_EXPIRES_AT:String(Date.now()+3600000)};
+const rows=[['id','json','revision','updatedAt','status']];const audit=[];let fetches=0,fetchMode='success';
+const sheet={getLastRow:()=>rows.length,getDataRange:()=>({getValues:()=>rows.map(r=>[...r])}),getRange:(row,col,n=1,width=5)=>({getValues:()=>rows.slice(row-1,row-1+n).map(r=>r.slice(col-1,col-1+width)),setValues:v=>{v.forEach((r,i)=>rows[row-1+i]=[...r]);}}),appendRow:r=>rows.push([...r]),deleteRow:r=>rows.splice(r-1,1)};
+const properties={getProperty:k=>values[k]||null,setProperty:(k,v)=>{values[k]=v;},deleteProperty:k=>{delete values[k];},getProperties:()=>({...values})};
+const ctx={console,PropertiesService:{getScriptProperties:()=>properties},SpreadsheetApp:{openById:()=>({getSheetByName:n=>n==='Posts'?sheet:{appendRow:r=>audit.push(r)}}),flush:()=>{}},LockService:{getScriptLock:()=>({waitLock:()=>{},releaseLock:()=>{}})},Utilities:{DigestAlgorithm:{SHA_256:'sha256'},computeDigest:(_,s)=>[...crypto.createHash('sha256').update(s).digest()],getUuid:()=>crypto.randomUUID()},HtmlService:{createHtmlOutput:s=>({html:s,setXFrameOptionsMode(){return this;}}),XFrameOptionsMode:{ALLOWALL:'ALLOWALL'}},UrlFetchApp:{fetch:()=>{fetches++;if(fetchMode==='timeout')throw Error('network');return {getResponseCode:()=>fetchMode==='forbidden'?403:201,getAllHeaders:()=>({'x-restli-id':'urn:li:share:123'}),getContentText:()=>JSON.stringify({access_token:'new-token',expires_in:3600,scope:'w_organization_social'})};}}};
+vm.createContext(ctx);vm.runInContext(fs.readFileSync('backend/Core.gs','utf8'),ctx);vm.runInContext(fs.readFileSync('backend/Code.gs','utf8'),ctx);
+const call=(action,data={})=>ctx.dispatch_({action,data});
+const auth={origin:values.PAGE_ORIGIN,key:values.WORKSPACE_KEY};
+assert.doesNotThrow(()=>ctx.authorized_(auth));
+assert.throws(()=>ctx.authorized_({...auth,key:'wrong'}),/authorization failed/);
+assert.throws(()=>ctx.authorized_({...auth,origin:'https://evil.example'}),/Origin/);
+const hostile=ctx.doPost({parameter:{payload:JSON.stringify({...auth,id:'</script><script>alert(1)</script>',action:'status'})}}).html;
+assert.ok(!hostile.includes('</script><script>'));
+let p=call('save',{post:valid});assert.equal(p.revision,1);
+assert.throws(()=>call('save',{post:valid}),/changed/);
+assert.throws(()=>call('save',{post:{...p,status:'published'}}),/publishing action/);
+assert.throws(()=>call('save',{post:{...p,body:'🚚'}}),/emojis/);
+assert.equal(fetches,0);
+let published=call('publish',{id:p.id,revision:p.revision});assert.equal(published.status,'published');assert.equal(fetches,1);
+assert.throws(()=>call('publish',{id:p.id,revision:published.revision}),/Only approved/);assert.equal(fetches,1);
+assert.throws(()=>call('delete',{id:p.id,revision:published.revision}),/cannot be deleted/);
+p=call('save',{post:{...valid,id:'timeout-post'}});fetchMode='timeout';assert.throws(()=>call('publish',{id:p.id,revision:p.revision}),/uncertain/);
+let unknown=call('load').posts.find(p=>p.id==='timeout-post');assert.equal(unknown.status,'publish_unknown');
+assert.throws(()=>call('publish',{id:unknown.id,revision:unknown.revision}),/Only approved/);
+assert.throws(()=>call('reconcile',{id:unknown.id,revision:unknown.revision}),/two minutes/);
+// Callback must reject a missing/expired state before calling the token endpoint.
+const count=fetches;ctx.doGet({parameter:{state:'unissued-state',code:'bad'}});assert.equal(fetches,count);
+values.LINKEDIN_CLIENT_ID='test-client';values.LINKEDIN_CLIENT_SECRET='test-secret';values.LINKEDIN_REDIRECT_URI='https://script.google.com/macros/s/test/exec';
+const oauth=call('oauthStart');const state=new URL(oauth.url).searchParams.get('state');assert.ok(state);fetchMode='success';
+// OAuth uses the same mock transport; return token-specific HTTP 200 here.
+ctx.UrlFetchApp.fetch=()=>{fetches++;return {getResponseCode:()=>200,getContentText:()=>JSON.stringify({access_token:'oauth-token',expires_in:3600,scope:'w_organization_social'})};};
+values.LINKEDIN_CLIENT_ID='test-client';values.LINKEDIN_CLIENT_SECRET='test-secret';values.LINKEDIN_REDIRECT_URI='https://script.google.com/macros/s/test/exec';
+
+ctx.doGet({parameter:{state,code:'test-code'}});assert.equal(values.LINKEDIN_ACCESS_TOKEN,'oauth-token');const exchanged=fetches;ctx.doGet({parameter:{state,code:'test-code'}});assert.equal(fetches,exchanged);
+call('disconnect');assert.equal(values.LINKEDIN_ACCESS_TOKEN,undefined);assert.equal(call('status').ready,false);console.log('Passed: editorial validation, authorization, HTML escaping, revision conflicts, approval gates, duplicate prevention, uncertain publication lock and OAuth state replay protection.');
